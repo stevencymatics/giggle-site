@@ -41,6 +41,10 @@
   #go .note{font-family:Unbounded,sans-serif;font-weight:800;font-size:54px;line-height:1;letter-spacing:-.02em}
   #go .sub{font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--dim)}
   #go.on .sub{color:var(--hot)}
+  #go.rec .ring{background:#ff2b2b;opacity:.95;animation:pulse 1.1s ease-in-out infinite}
+  #go.rec .sub{color:#ff6b6b}
+  @keyframes pulse{50%{filter:blur(6px)}}
+  .take.cur{background:linear-gradient(90deg,rgba(224,33,138,.12),transparent);margin:0 -14px;padding:10px 14px;border-radius:12px}
   .mic-ico{width:46px;height:46px}
   .tuner{width:min(80vw,300px);height:22px;margin-top:16px;position:relative;border-radius:11px;background:var(--panel);
     box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
@@ -113,13 +117,16 @@
     </button>
     <div class="tuner"><div id="needle"></div></div>
     <div class="tlabels"><span>FLAT</span><span>IN TUNE</span><span>SHARP</span></div>
-    <p class="hint" id="hint">Wear <b>wired headphones</b> to hear yourself live (Bluetooth adds lag and the speaker will feed back). No headphones? Turn <b>Live</b> off, hit <b>Record</b>, then play it back.</p>
+    <p class="hint" id="hint">Tap the circle and sing, then tap again to stop. It plays your take back through the effects. Move any knob while it plays and you'll hear the change right away.</p>
   </div>
 
   <div class="row">
-    <button class="btn on" id="mon">🎧 Live: On</button>
-    <button class="btn rec" id="rec" disabled>● Record</button>
-    <button class="btn" id="byp" disabled>A/B: FX</button>
+    <button class="btn" id="play" disabled>▶ Play</button>
+    <button class="btn" id="loop">🔁 Loop: Off</button>
+    <button class="btn" id="byp">A/B: FX</button>
+  </div>
+  <div class="row" style="margin-top:-6px">
+    <button class="btn" id="mon" style="font-weight:500;font-size:13px">🎧 Hear myself while recording: Off <span style="color:var(--dim)">(headphones only)</span></button>
   </div>
 
   <section>
@@ -138,7 +145,7 @@
 
   <section>
     <h2>Takes</h2>
-    <div id="takes"><div class="empty">Recordings show up here. Play, download or share them.</div></div>
+    <div id="takes"><div class="empty">Your takes show up here. Replay any take with new settings, then download or share it.</div></div>
   </section>
   <footer>CYMATICS · VOX LAB PROTOTYPE</footer>
 </div>
@@ -196,75 +203,62 @@ renderPresets();
 chips($('keys'),NOTES.map((n,i)=>[i,n]),P.key,'key',v=>{P.key=v;apply('key');save();});
 chips($('scales'),SCALE_LABELS,P.scale,'',v=>{P.scale=v;apply('scale');save();});
 
-// ---------- Audio ----------
-let ctx=null,stream=null,G=null,running=false,monitor=true,bypass=false,wakeLock=null,starting=false;
+// ---------- Audio engine ----------
+// One AudioContext + effect chain for the whole session. The chain's input is either
+// the mic (while recording) or a recorded take (while playing back).
+let ctx=null,G=null,ready=null;
+let mode='idle';            // idle | rec | play
+let liveMon=false,bypass=false,loop=false,wakeLock=null,busy=false;
+let mic=null;               // {stream,src}
+let rawChunks=[],tapDone=null,procRec=null;
+let playSrc=null,renderRec=null;
+const takes=[];let cur=null;
+
+function setSession(t){try{if(navigator.audioSession)navigator.audioSession.type=t;}catch(e){}}
 
 function makeIR(ctx,sec){
   const sr=ctx.sampleRate,len=Math.floor(sr*sec),b=ctx.createBuffer(2,len,sr);
   for(let ch=0;ch<2;ch++){const d=b.getChannelData(ch);let lp=0;
     for(let i=0;i<len;i++){const t=i/sr,n=Math.random()*2-1,a=Math.min(.92,.15+.8*t/sec);lp=lp*a+n*(1-a);
-      const env=Math.pow(10,-3*t/sec)*Math.min(1,t/.006);d[i]=lp*env*(1+ .6*(1-t/sec));}}
+      const env=Math.pow(10,-3*t/sec)*Math.min(1,t/.006);d[i]=lp*env*(1+.6*(1-t/sec));}}
   return b;
 }
 function satCurve(){const n=2048,c=new Float32Array(n);for(let i=0;i<n;i++){const x=i/(n-1)*2-1;c[i]=Math.tanh(x*1.6)/Math.tanh(1.6);}return c;}
 
-async function start(){
-  if(starting)return; starting=true;
-  $('sub').textContent='Starting…';
-  try{
-    try{if(navigator.audioSession)navigator.audioSession.type='play-and-record';}catch(e){}
+// Must be called from a tap: creates/resumes the context inside the gesture.
+function ensureCtx(){
+  if(!ctx){
+    setSession('play-and-record');
     ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
-    const resumed=ctx.resume();
-    if(!ctx.audioWorklet) throw new Error('This browser has no AudioWorklet. Use Safari (iOS 14.5+) or Chrome.');
-    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
-    await resumed;
-    await ctx.audioWorklet.addModule('tuner-worklet.js?v=3');
-    build();
-    running=true; applyAll();
-    $('go').classList.add('on'); $('micIco').style.display='none'; $('note').hidden=false; $('note').textContent='–';
-    $('sub').textContent='Live · tap to stop'; $('rec').disabled=false; $('byp').disabled=false;
-    $('stat').innerHTML='<b>●</b> '+Math.round(ctx.sampleRate/100)/10+'k · '+Math.round(((ctx.baseLatency||0)+(ctx.outputLatency||0))*1000+G.tunerLatencyMs)+' ms';
-    try{wakeLock=await navigator.wakeLock?.request('screen');}catch(e){}
-  }catch(e){
-    console.error(e); stop();
-    $('hint').innerHTML='<span class="err">'+(e.name==='NotAllowedError'?'Microphone access was blocked. Allow the mic for this site in your browser settings and try again.':(e.message||e))+'</span>';
-    $('sub').textContent='Tap to go live';
-  }
-  starting=false;
-}
-function stop(){
-  if(G&&G.rec&&G.rec.state==='recording')G.rec.stop();
-  running=false;
-  try{stream&&stream.getTracks().forEach(t=>t.stop());}catch(e){}
-  try{ctx&&ctx.close();}catch(e){}
-  ctx=null;stream=null;G=null;
-  $('go').classList.remove('on');$('micIco').style.display='';$('note').hidden=true;$('sub').textContent='Tap to go live';
-  $('rec').disabled=true;$('rec').classList.remove('on');$('rec').textContent='● Record';$('byp').disabled=true;
-  $('needle').style.opacity=0;$('go').style.setProperty('--lv',1);$('stat').textContent='Off';
-  try{wakeLock&&wakeLock.release();}catch(e){} wakeLock=null;
+    const r=ctx.resume();
+    if(!ctx.audioWorklet){ready=Promise.reject(new Error('This browser has no AudioWorklet. Use Safari (iOS 14.5+) or Chrome.'));return ready;}
+    ready=r.then(()=>ctx.audioWorklet.addModule('tuner-worklet.js?v=4')).then(()=>{build();applyAll();setMon();});
+  }else ctx.resume();
+  return ready;
 }
 
 function build(){
   const c=ctx, g=v=>{const n=c.createGain();n.gain.value=v;return n;};
   const bq=(type,f,q,gain)=>{const n=c.createBiquadFilter();n.type=type;n.frequency.value=f;if(q!=null)n.Q.value=q;if(gain!=null)n.gain.value=gain;return n;};
-  const mic=c.createMediaStreamSource(stream);
+  const inNode=g(1);
   const inGain=g(1.4), hp=bq('highpass',95,.7);
   const tuner=new AudioWorkletNode(c,'vocal-tuner',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1],channelCount:1,channelCountMode:'explicit'});
   tuner.port.onmessage=e=>onStatus(e.data);
-  mic.connect(inGain).connect(hp).connect(tuner);
+  inNode.connect(inGain).connect(hp).connect(tuner);
 
-  // tone + dynamics
+  // raw mic capture (pulled through a silent output so it always runs)
+  const tap=new AudioWorkletNode(c,'pcm-tap',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1],channelCount:1,channelCountMode:'explicit'});
+  tap.port.onmessage=e=>{if(e.data.chunk)rawChunks.push(e.data.chunk);else if(e.data.done&&tapDone){tapDone();tapDone=null;}};
+  tap.connect(g(0)).connect(c.destination);
+
   const comp=c.createDynamicsCompressor();
   comp.threshold.value=-30;comp.knee.value=8;comp.ratio.value=5;comp.attack.value=.004;comp.release.value=.14;
   const makeup=g(3.2), mud=bq('peaking',320,1,-3.5), pres=bq('peaking',3600,.9,4.5), air=bq('highshelf',10000,null,5);
   const pre=g(1), shaper=c.createWaveShaper(); shaper.curve=satCurve(); shaper.oversample='4x'; const post=g(1);
   const vox=g(1);
   tuner.connect(comp).connect(makeup).connect(mud).connect(pres).connect(air).connect(pre).connect(shaper).connect(post).connect(vox);
+  const bus=g(1); vox.connect(bus);
 
-  const bus=g(1);
-  vox.connect(bus);
-
-  // doubler: two short modulated delays panned wide
   const width=g(0);
   [[-1,.012,.23],[1,.019,.31]].forEach(([side,t,rate])=>{
     const d=c.createDelay(.06);d.delayTime.value=t;
@@ -274,7 +268,6 @@ function build(){
   });
   width.connect(bus);
 
-  // ping-pong delay
   const dSend=g(0), dL=c.createDelay(2), dR=c.createDelay(2);
   dL.delayTime.value=.375; dR.delayTime.value=.375;
   const fbHp=bq('highpass',300,.7), fbLp=bq('lowpass',3800,.7), fb=g(.42), dOut=g(.9);
@@ -283,30 +276,27 @@ function build(){
   dL.connect(pL).connect(dOut); dL.connect(dR); dR.connect(pR).connect(dOut); dR.connect(fb).connect(dL);
   dOut.connect(bus);
 
-  // reverb
   const rSend=g(0), preD=c.createDelay(.2); preD.delayTime.value=.028;
   const conv=c.createConvolver(); conv.buffer=makeIR(c,3.4);
   const rHp=bq('highpass',220,.7), rOut=g(.9);
   vox.connect(rSend); dOut.connect(rSend);
   rSend.connect(preD).connect(rHp).connect(conv).connect(rOut).connect(bus);
 
-  // A/B + master
   const proc=g(1), raw=g(0);
-  bus.connect(proc);
-  mic.connect(raw);
+  bus.connect(proc); inNode.connect(raw);
   const lim=c.createDynamicsCompressor();
   lim.threshold.value=-3;lim.knee.value=0;lim.ratio.value=20;lim.attack.value=.002;lim.release.value=.08;
-  const out=g(P.volume), mon=g(monitor?1:0);
+  const out=g(P.volume), mon=g(0);
   proc.connect(lim); raw.connect(lim);
   lim.connect(out); out.connect(mon).connect(c.destination);
   const recDest=c.createMediaStreamDestination(); out.connect(recDest);
-
-  G={tuner,width,dSend,rSend,pre,post,out,mon,proc,raw,recDest,dL,dR,tunerLatencyMs:Math.ceil(c.sampleRate/75)*2.5/c.sampleRate*1000};
+  G={inNode,tap,tuner,width,dSend,rSend,pre,post,out,mon,proc,raw,recDest};
+  if(bypass){proc.gain.value=0;raw.gain.value=2.2;}
 }
 
 const ramp=(p,v)=>{if(!ctx)return;p.cancelScheduledValues(ctx.currentTime);p.setTargetAtTime(v,ctx.currentTime,.03);};
 function apply(k){
-  if(!running||!G)return;
+  if(!G)return;
   const t=G.tuner.port;
   switch(k){
     case 'amount':t.postMessage({amount:P.amount});break;
@@ -322,9 +312,104 @@ function apply(k){
   }
 }
 function applyAll(){['amount','octave','transpose','key','scale','width','delay','reverb','grit','volume'].forEach(apply);}
+// Speaker only gets sound during playback, or while recording if the user opted in with headphones.
+function setMon(){if(G)ramp(G.mon.gain,mode==='play'||(mode==='rec'&&liveMon)?1:0);}
 
-// live readout
+function pickType(){
+  const types=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/ogg'];
+  return window.MediaRecorder&&MediaRecorder.isTypeSupported?types.find(t=>MediaRecorder.isTypeSupported(t)):undefined;
+}
+function startMediaRec(){
+  if(!window.MediaRecorder)return null;
+  const mt=pickType();let r;
+  try{r=new MediaRecorder(G.recDest.stream,mt?{mimeType:mt}:undefined);}catch(e){return null;}
+  const chunks=[];r.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
+  r.done=new Promise(res=>{r.onstop=()=>{const type=r.mimeType||mt||'audio/webm';res(chunks.length?new Blob(chunks,{type}):null);};});
+  r.start(250);return r;
+}
+
+// ---------- Record / play ----------
+async function startRec(){
+  stopPlay();
+  try{
+    await ensureCtx();
+    setSession('play-and-record');
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+    await ctx.resume();
+    const src=ctx.createMediaStreamSource(stream);
+    src.connect(G.inNode); src.connect(G.tap);
+    mic={stream,src};
+    rawChunks=[]; G.tap.port.postMessage({rec:true});
+    procRec=startMediaRec();
+    mode='rec'; setMon(); ui();
+    try{wakeLock=await navigator.wakeLock?.request('screen');}catch(e){}
+  }catch(e){
+    console.error(e); mode='idle'; ui();
+    $('hint').innerHTML='<span class="err">'+(e.name==='NotAllowedError'?'Microphone access was blocked. Allow the mic for this site in your browser settings and try again.':(e.message||e))+'</span>';
+  }
+}
+
+async function stopRec(){
+  const done=new Promise(r=>tapDone=r);
+  G.tap.port.postMessage({rec:false});
+  await Promise.race([done,new Promise(r=>setTimeout(r,600))]);
+  try{mic.src.disconnect();}catch(e){} try{mic.stream.getTracks().forEach(t=>t.stop());}catch(e){}
+  mic=null;
+  try{wakeLock&&wakeLock.release();}catch(e){} wakeLock=null;
+  setSession('playback');
+  const len=rawChunks.reduce((a,c)=>a+c.length,0);
+  let blob=null; if(procRec){procRec.stop();blob=await procRec.done;procRec=null;}
+  mode='idle';
+  if(len<ctx.sampleRate*.3){ui();$('hint').textContent='That take was too short. Tap and sing for at least a second.';return;}
+  const buf=ctx.createBuffer(1,len,ctx.sampleRate),d=buf.getChannelData(0);let o=0;
+  rawChunks.forEach(c=>{d.set(c,o);o+=c.length;}); rawChunks=[];
+  const take={n:takes.length+1,buf,sec:len/ctx.sampleRate,blob,url:blob?URL.createObjectURL(blob):null};
+  takes.push(take); addTakeUI(take);
+  play(take);
+}
+
+function play(take){
+  stopPlay();
+  ensureCtx(); ctx.resume();
+  cur=take;
+  const s=ctx.createBufferSource(); s.buffer=take.buf; s.loop=loop;
+  s.connect(G.inNode); playSrc=s;
+  mode='play'; setMon(); ui();
+  // capture this pass with the current settings, so Download gets the latest sound
+  const r=loop?null:startMediaRec(); renderRec=r;
+  s.onended=()=>{
+    if(playSrc!==s)return;
+    playSrc=null; mode='idle'; ui();
+    if(r){setTimeout(async()=>{if(renderRec!==r)return;renderRec=null;r.stop();const b=await r.done;if(b)setTakeFile(take,b);},2200);}
+  };
+  s.start();
+}
+function stopPlay(){
+  if(playSrc){const s=playSrc;playSrc=null;s.onended=null;try{s.stop();}catch(e){}try{s.disconnect();}catch(e){}}
+  if(renderRec){const r=renderRec;renderRec=null;try{r.stop();}catch(e){}}
+  if(mode==='play'){mode='idle';setMon();}
+  ui();
+}
+
+// ---------- UI state ----------
+function ui(){
+  const go=$('go');
+  go.classList.toggle('rec',mode==='rec'); go.classList.toggle('on',mode==='play');
+  $('micIco').style.display=mode==='idle'?'':'none'; $('note').hidden=mode==='idle';
+  if(mode!=='idle'&&!$('note').textContent)$('note').textContent='–';
+  $('sub').textContent=mode==='rec'?'Recording · tap to stop':mode==='play'?'Playing · tap to record new':(takes.length?'Tap to record again':'Tap to record');
+  $('stat').innerHTML=mode==='rec'?'<b style="color:#ff4b4b">●</b> Recording':mode==='play'?'<b>▶</b> Playing':(ctx?'Ready':'Off');
+  $('play').disabled=!cur||mode==='rec';
+  $('play').textContent=mode==='play'?'■ Stop':'▶ Play';
+  if(mode==='idle'){$('needle').style.opacity=0;go.style.setProperty('--lv',1);}
+  document.querySelectorAll('.take').forEach(el=>{
+    const t=takes[+el.dataset.i]; el.classList.toggle('cur',t===cur);
+    el.querySelector('.pb').textContent=(t===cur&&mode==='play')?'■ Stop':'▶ Play';
+    el.querySelector('.pb').disabled=mode==='rec';
+  });
+}
 function onStatus(s){
+  if(mode==='idle')return;
   const lv=Math.min(1,Math.sqrt(s.lvl)*2.2);
   $('go').style.setProperty('--lv',1+lv*.12);
   const nd=$('needle');
@@ -335,37 +420,40 @@ function onStatus(s){
   }else{nd.style.opacity=.15;nd.style.left='50%';}
 }
 
-$('go').onclick=()=>{running?stop():start();};
-$('mon').onclick=()=>{monitor=!monitor;$('mon').classList.toggle('on',monitor);$('mon').textContent='🎧 Live: '+(monitor?'On':'Off');if(G)ramp(G.mon.gain,monitor?1:0);};
+function extFor(type){return type.includes('mp4')?'m4a':type.includes('ogg')?'ogg':'webm';}
+function setTakeFile(take,blob,first){
+  if(take.url)URL.revokeObjectURL(take.url);
+  take.blob=blob; take.url=URL.createObjectURL(blob);
+  const el=document.querySelector(`.take[data-i="${take.n-1}"]`); if(!el)return;
+  const a=el.querySelector('a.dl'); a.href=take.url; a.download=`vox-take-${take.n}.${extFor(blob.type)}`; a.style.display='';
+  a.textContent='⬇ Download'; el.querySelector('.tt span:last-child').textContent=take.sec.toFixed(1)+'s'+(first?'':' · download = latest settings');
+}
+function addTakeUI(take){
+  const host=$('takes');const e=host.querySelector('.empty');if(e)e.remove();
+  const d=document.createElement('div');d.className='take';d.dataset.i=take.n-1;
+  d.innerHTML=`<div class="tt"><span>Take ${take.n}</span><span>${take.sec.toFixed(1)}s</span></div>
+    <div class="acts"><button class="pb">▶ Play</button><a class="dl" style="display:none">⬇ Download</a></div>`;
+  d.querySelector('.pb').onclick=()=>{if(cur===take&&mode==='play')stopPlay();else play(take);};
+  if(navigator.canShare){const b=document.createElement('button');b.textContent='↗ Share';
+    b.onclick=()=>{if(!take.blob)return;const f=new File([take.blob],`vox-take-${take.n}.${extFor(take.blob.type)}`,{type:take.blob.type});
+      if(navigator.canShare({files:[f]}))navigator.share({files:[f]}).catch(()=>{});};
+    d.querySelector('.acts').appendChild(b);}
+  host.prepend(d);
+  if(take.blob)setTakeFile(take,take.blob,true);
+}
+
+// ---------- Buttons ----------
+$('go').onclick=()=>{if(busy)return;
+  if(mode==='rec'){busy=true;stopRec().finally(()=>{busy=false;});}
+  else{busy=true;startRec().finally(()=>{busy=false;});}};
+$('play').onclick=()=>{if(mode==='play')stopPlay();else if(cur)play(cur);};
+$('loop').onclick=()=>{loop=!loop;$('loop').classList.toggle('on',loop);$('loop').textContent='🔁 Loop: '+(loop?'On':'Off');
+  if(playSrc){playSrc.loop=loop;if(loop&&renderRec){const r=renderRec;renderRec=null;try{r.stop();}catch(e){}}}};
 $('byp').onclick=()=>{bypass=!bypass;$('byp').classList.toggle('on',bypass);$('byp').textContent=bypass?'A/B: RAW':'A/B: FX';
   if(G){ramp(G.proc.gain,bypass?0:1);ramp(G.raw.gain,bypass?2.2:0);}};
-
-// recording
-let takeN=0;
-$('rec').onclick=()=>{
-  if(!G)return;
-  if(G.rec&&G.rec.state==='recording'){G.rec.stop();return;}
-  const types=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/ogg'];
-  const mt=window.MediaRecorder&&MediaRecorder.isTypeSupported?types.find(t=>MediaRecorder.isTypeSupported(t)):undefined;
-  let rec; try{rec=new MediaRecorder(G.recDest.stream,mt?{mimeType:mt}:undefined);}catch(e){$('hint').innerHTML='<span class="err">Recording is not supported in this browser.</span>';return;}
-  const chunks=[];const t0=Date.now();
-  rec.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
-  rec.onstop=()=>{$('rec').classList.remove('on');$('rec').textContent='● Record';
-    const type=rec.mimeType||mt||'audio/webm';addTake(new Blob(chunks,{type}),type,(Date.now()-t0)/1000);};
-  rec.start(250);G.rec=rec;$('rec').classList.add('on');$('rec').textContent='■ Stop';
-};
-function addTake(blob,type,sec){
-  takeN++;const ext=type.includes('mp4')?'m4a':type.includes('ogg')?'ogg':'webm';
-  const name=`vox-take-${takeN}.${ext}`,url=URL.createObjectURL(blob);
-  const host=$('takes');const e=host.querySelector('.empty');if(e)e.remove();
-  const d=document.createElement('div');d.className='take';
-  d.innerHTML=`<div class="tt"><span>Take ${takeN}</span><span>${sec.toFixed(1)}s</span></div><audio controls playsinline src="${url}"></audio>
-    <div class="acts"><a href="${url}" download="${name}">⬇ Download</a></div>`;
-  const file=new File([blob],name,{type});
-  if(navigator.canShare&&navigator.canShare({files:[file]})){const b=document.createElement('button');b.textContent='↗ Share';
-    b.onclick=()=>navigator.share({files:[file],title:name}).catch(()=>{});d.querySelector('.acts').appendChild(b);}
-  host.prepend(d);
-}
+$('mon').onclick=()=>{liveMon=!liveMon;$('mon').classList.toggle('on',liveMon);
+  $('mon').innerHTML='🎧 Hear myself while recording: '+(liveMon?'On':'Off')+' <span style="color:var(--dim)">(headphones only)</span>';setMon();};
+ui();
 </script>
 </body>
 </html>

@@ -287,6 +287,35 @@ if (typeof registerProcessor === 'function') {
     }
   }
   registerProcessor('vocal-tuner', TunerProcessor);
+
+  // Captures the raw mic as PCM so a take can be replayed through the chain.
+  class PcmTap extends AudioWorkletProcessor {
+    constructor() {
+      super();
+      this.on = false;
+      this.buf = new Float32Array(16384);
+      this.i = 0;
+      this.port.onmessage = (e) => {
+        if (e.data.rec) { this.on = true; this.i = 0; }
+        else { this.flush(); this.on = false; this.port.postMessage({ done: true }); }
+      };
+    }
+    flush() {
+      if (this.i) this.port.postMessage({ chunk: this.buf.slice(0, this.i) });
+      this.i = 0;
+    }
+    process(inputs) {
+      const x = inputs[0] && inputs[0][0];
+      if (this.on && x) {
+        for (let k = 0; k < x.length; k++) {
+          this.buf[this.i++] = x[k];
+          if (this.i === this.buf.length) this.flush();
+        }
+      }
+      return true;
+    }
+  }
+  registerProcessor('pcm-tap', PcmTap);
 }
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { VocalTuner, SCALES };
